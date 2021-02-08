@@ -1,0 +1,288 @@
+#!/usr/bin/python3
+
+# BSD 3-Clause License
+#
+# Copyright (c) 2021, higherkinded
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+from argparse import ArgumentParser
+from subprocess import Popen, run, PIPE
+from os import environ, path, chdir, listdir
+
+
+PASS_LIST = ('pass', 'list')
+HOME = environ['HOME']
+EXPORT_LOCATION = f'{HOME}/.local/share/pass_export'
+IMPORT_LOCATION = f'{HOME}/.local/share/pass_import'
+
+
+__DO_SHRED = True
+
+
+def parse_args():
+    parser = ArgumentParser()
+    parser.add_argument('-e', '--export', dest='passwords', nargs='+',
+                        help='Passwords to be exported')
+    parser.add_argument('-r', '--recipient', dest='recipient_id', nargs=1,
+                        help='Recipient to be used during import/export',
+                        required=True)
+    parser.add_argument('-i', '--import', dest='tarball', nargs=1,
+                        help='Path to tarball to import')
+
+    return parser.parse_args()
+
+
+def prepare_dirs():
+    run(('rm', '-r', EXPORT_LOCATION), capture_output=True)
+    run(('rm', '-r', IMPORT_LOCATION), capture_output=True)
+    run(('mkdir', '-p', IMPORT_LOCATION), capture_output=True)
+    run(('mkdir', '-p', EXPORT_LOCATION), capture_output=True)
+
+
+def confirm(confirmation_msg: str) -> bool:
+    while True:
+        result = input(f'{confirmation_msg}? [Y/N]: ')[0].lower()
+        if result == 'y':
+            return True
+        if result == 'n':
+            return False
+        print('Y or N only, please')
+
+
+def __shred(filename):
+    if __DO_SHRED:
+        return not run(('shred', filename), capture_output=True).returncode
+    else:
+        return True
+
+
+def shred(filename):
+    return __shred(filename) \
+       and not run(('rm', filename), capture_output=True).returncode
+
+
+class Tarball(object):
+    def __init__(self, recipient_id: str):
+        self.filename = f'{recipient_id}.tar.gz'
+        self.export_path = f'{EXPORT_LOCATION}/{self.filename}'
+        self.import_path = f'{IMPORT_LOCATION}/{self.filename}'
+        self.encname = f'{self.export_path}.gpg'
+        self.recipient_id = recipient_id
+
+    def create(self, files):
+        return not run((
+            'tar', 'cpvf',
+            self.export_path,
+            *files
+        ), capture_output=True).returncode
+
+    def unpack(self):
+        return not run((
+            'tar', 'xpf',
+            self.import_path,
+            '-C', IMPORT_LOCATION
+        ), capture_output=True).returncode
+
+    def decrypt(self, filename):
+        return not run((
+            'gpg2',
+            '--recipient', self.recipient_id,
+            '--output', self.import_path,
+            '--decrypt', filename,
+        ), capture_output=True).returncode
+
+    def encrypt(self):
+        gpg_p = run(('gpg2',
+                     '--output', self.encname,
+                     '--recipient', self.recipient_id,
+                     '--encrypt', self.export_path), capture_output=True)
+        return not gpg_p.returncode
+
+    def shred(self, export=True):
+        shred(self.export_path if export else self.import_path)
+
+
+class Password(object):
+    def __init__(self, pwname: str):
+        self.name = pwname
+        self.gpg_file = f'{pwname}.gpg'
+
+    def encrypt(self, recipient_id: str) -> bool:
+        ps = Popen(('pass', self.name), stdout=PIPE)
+        ps.wait()
+        gpg_p = run(('gpg2',
+                     '--output', self.gpg_file,
+                     '--recipient', recipient_id,
+                     '--encrypt'
+                     ), stdin=ps.stdout)
+        return not gpg_p.returncode
+
+    def reinsert(self, recipient_id: str) -> bool:
+        ps = Popen(('gpg2',
+                    '--recipient', recipient_id,
+                    '--decrypt', self.gpg_file
+                    ), stdout=PIPE)
+        ps.wait()
+        gpg_p = run(('pass', 'insert', '-e', self.name), stdin=ps.stdout)
+        return not gpg_p.returncode
+
+    def shred(self):
+        return shred(self.gpg_file)
+
+
+def get_pass_list():
+    pass_list = run(PASS_LIST, capture_output=1) \
+        .stdout \
+        .splitlines()[1:]
+    lines = map(lambda x: str.split(x.decode('utf-8'), ' ')[1], pass_list)
+
+    out = {}
+    for line in lines:
+        out[line] = Password(line)
+
+    return out
+
+
+def show_transfered(passwords) -> None:
+    print('These passwords will be exported:')
+    for pw in passwords:
+        print(f'- {passwords[pw].name}')
+
+
+def tar(name, files) -> bool:
+    return not run((
+        'tar', 'cpf',
+        '-C', EXPORT_LOCATION, name, *files)).returncode
+
+
+def export_passwords(passwords, recipient_id):
+    show_transfered(passwords)
+
+    if not confirm('Proceed'):
+        print('Nothing to do. Exiting.')
+        exit(1)
+
+    chdir(EXPORT_LOCATION)
+
+    files = []
+
+    print('> Exporting and encrypting passwords...')
+    for pw in passwords.values():
+        print(f'  * Encrypting password: {pw.name}')
+        if not pw.encrypt(recipient_id):
+            print('Failed to encrypt. Check if you have correct write',
+                  'permissions, enter the passphrase right and use an',
+                  'existing public key.')
+            exit(2)
+        files.append(pw.gpg_file)
+
+    print('> Creating a tarball with encrypted password files...')
+    tgz = Tarball(recipient_id)
+    if not tgz.create(files):
+        print('Failed to archive. Check if you have correct write permissions',
+              f'to your destination ({tgz.export_path})')
+        exit(2)
+
+    print('> Shredding encrypted passwords...')
+    for pw in passwords.values():
+        pw.shred()
+
+    print('> Encrypting the tarball...')
+    tgz.encrypt()
+
+    print('> Shredding the unencrypted tarball copy...')
+    tgz.shred()
+
+
+def import_passwords(tarball_name, recipient_id, passwords):
+    chdir(IMPORT_LOCATION)
+
+    tgz = Tarball(recipient_id)
+
+    print('> Decrypting the tarball...')
+    tgz.decrypt(tarball_name)
+
+    print('> Unpacking the tarball...')
+    tgz.unpack()
+
+    print('> Shredding the unencrypted tarball...')
+    tgz.shred(export=False)
+
+    print('> Deciding which passwords are to be imported.')
+    files = listdir(IMPORT_LOCATION)
+    print(files)
+    password_names = {}
+
+    for filename in files:
+        pwname = filename[:-4]
+        password_names[pwname] = filename
+
+    print(password_names)
+
+    for pwname in password_names:
+        shall_import = True
+        if passwords.get(pwname):
+            shall_import = confirm(
+                f'  * Password "{pwname}" is found locally. Overwrite it')
+
+        if shall_import:
+            print(f'  * Importing: "{pwname}"')
+            Password(pwname).reinsert(recipient_id)
+
+
+def select_passwords(selpass, passwords):
+    out = {}
+    for pwname in selpass:
+        pw = passwords.get(pwname)
+        if pw:
+            out[pwname] = pw
+
+    return out
+
+
+def main():
+    args = parse_args()
+    rid = args.recipient_id[0]
+    prepare_dirs()
+
+    passwords = get_pass_list()
+
+    if args.tarball:
+        tarname = path.abspath(args.tarball[0])
+        import_passwords(tarname, rid, passwords)
+        return
+
+    if args.passwords:
+        passwords = select_passwords(args.passwords, passwords)
+
+    export_passwords(passwords, rid)
+
+
+if __name__ == '__main__':
+    main()
